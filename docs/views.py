@@ -1,66 +1,95 @@
-from rest_framework import viewsets, mixins
-from rest_framework.permissions import IsAuthenticatedOrReadOnly, IsAuthenticated
-from rest_framework.response import Response
-from rest_framework.decorators import action
 from django.db.models import Q
-from .models import BeltLevel, Technique, Document
-from .serializers import BeltLevelSerializer, TechniqueSerializer, DocumentSerializer
-from .permissions import IsAdminOrInstructorWrite
+from rest_framework import generics, permissions
+from rest_framework.pagination import PageNumberPagination
+from rest_framework.parsers import MultiPartParser, FormParser
 
-class BeltLevelViewSet(viewsets.ModelViewSet):
-    queryset = BeltLevel.objects.all().prefetch_related("techniques")
-    serializer_class = BeltLevelSerializer
-    permission_classes = [IsAuthenticatedOrReadOnly & IsAdminOrInstructorWrite]
+from users.permissions import IsEmailVerified
+from .models import BeltLevel as Level, Technique, Document
+from .serializers import LevelSerializer, TechniqueSerializer, DocumentSerializer
+from .permissions import (
+    IsAdminOrInstructorOrReadOnly,
+    IsAdminInstructorAlumnoReadOnly,
+)
 
-    def get_queryset(self):
-        qs = super().get_queryset()
-        user = self.request.user
-        # Si no estás autenticado o eres alumno, sólo niveles públicos
-        if not user.is_authenticated or getattr(user, "role", "alumno") == "alumno":
-            qs = qs.filter(is_public=True)
-        return qs
+# ------------------------------
+# 🔹 Paginación por defecto
+# ------------------------------
+class DefaultPagination(PageNumberPagination):
+    page_size = 20
+    page_size_query_param = "page_size"
+    max_page_size = 100
 
-    @action(detail=True, methods=["get"], permission_classes=[IsAuthenticated])
-    def techniques(self, request, pk=None):
-        level = self.get_object()
-        ser = TechniqueSerializer(level.techniques.all(), many=True)
-        return Response(ser.data)
 
-class TechniqueViewSet(viewsets.ModelViewSet):
-    queryset = Technique.objects.select_related("level")
+# ------------------------------
+# 🔹 Niveles (lectura pública)
+# ------------------------------
+class LevelListCreateView(generics.ListCreateAPIView):
+    queryset = Level.objects.all().order_by("order", "id")
+    serializer_class = LevelSerializer
+    permission_classes = [IsAdminOrInstructorOrReadOnly]
+    pagination_class = DefaultPagination
+
+
+class LevelDetailView(generics.RetrieveUpdateDestroyAPIView):
+    queryset = Level.objects.all()
+    serializer_class = LevelSerializer
+    permission_classes = [IsAdminOrInstructorOrReadOnly]
+
+
+# ------------------------------
+# 🔹 Técnicas (lectura pública)
+# ------------------------------
+class TechniqueListCreateView(generics.ListCreateAPIView):
     serializer_class = TechniqueSerializer
-    permission_classes = [IsAuthenticatedOrReadOnly & IsAdminOrInstructorWrite]
+    permission_classes = [IsAdminOrInstructorOrReadOnly]
+    pagination_class = DefaultPagination
 
     def get_queryset(self):
-        qs = super().get_queryset()
-        user = self.request.user
-        if not user.is_authenticated or getattr(user, "role", "alumno") == "alumno":
-            qs = qs.filter(level__is_public=True)
-        # filtros opcionales ?level=ID & ?q=texto
+        queryset = Technique.objects.select_related("level").all()
         level_id = self.request.query_params.get("level")
-        if level_id:
-            qs = qs.filter(level_id=level_id)
         q = self.request.query_params.get("q")
-        if q:
-            qs = qs.filter(Q(name__icontains=q) | Q(description__icontains=q))
-        return qs
 
-class DocumentViewSet(viewsets.ModelViewSet):
-    queryset = Document.objects.all()
+        if level_id:
+            queryset = queryset.filter(level_id=level_id)
+        if q:
+            queryset = queryset.filter(
+                Q(name__icontains=q) | Q(description__icontains=q)
+            )
+
+        return queryset.order_by("id")
+
+
+class TechniqueDetailView(generics.RetrieveUpdateDestroyAPIView):
+    queryset = Technique.objects.select_related("level").all()
+    serializer_class = TechniqueSerializer
+    permission_classes = [IsAdminOrInstructorOrReadOnly]
+
+
+# ------------------------------
+# 🔹 Documentos (solo autenticados)
+# ------------------------------
+
+class DocumentListCreateView(generics.ListCreateAPIView):
     serializer_class = DocumentSerializer
-    permission_classes = [IsAuthenticatedOrReadOnly & IsAdminOrInstructorWrite]
+    permission_classes = [IsAdminInstructorAlumnoReadOnly]
+    pagination_class = DefaultPagination
+    parser_classes = [MultiPartParser, FormParser]  # 👈 IMPORTANTE
 
     def get_queryset(self):
-        qs = super().get_queryset()
         user = self.request.user
-        # visibilidad por rol
-        # admin ve todo; instructor no ve admin-only; alumno ve alumno/public; anónimo sólo public
-        role = getattr(user, "role", None) if user.is_authenticated else None
+        qs = Document.objects.all().order_by("-created_at", "id")
+        if not user.is_authenticated:
+            return qs.filter(visibility="public")
+        role = getattr(user, "role", "ALUMNO")
         if role == "ADMIN":
             return qs
         if role == "INSTRUCTOR":
-            return qs.exclude(visibility="admin")
+            return qs.filter(visibility__in=["public", "instructor", "alumno"])
         if role == "ALUMNO":
-            return qs.filter(visibility__in=["alumno", "public"])
-        # anónimo
+            return qs.filter(visibility__in=["public", "alumno"])
         return qs.filter(visibility="public")
+
+class DocumentDetailView(generics.RetrieveUpdateDestroyAPIView):
+    queryset = Document.objects.all()
+    serializer_class = DocumentSerializer
+    permission_classes = [IsAdminInstructorAlumnoReadOnly]

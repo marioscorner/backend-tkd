@@ -1,3 +1,4 @@
+# backend-tkd-main/chat/views.py
 from rest_framework import viewsets, mixins, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -5,6 +6,9 @@ from rest_framework.permissions import IsAuthenticated
 from django.db import transaction
 from django.contrib.auth import get_user_model
 from django.utils import timezone
+from asgiref.sync import async_to_sync
+from channels.layers import get_channel_layer
+from friends.utils import is_blocked_either
 
 from .models import Conversation, ConversationParticipant, Message
 from .serializers import (
@@ -12,6 +16,7 @@ from .serializers import (
     MessageSerializer, MessageCreateSerializer
 )
 from .permissions import IsConversationParticipant
+from .pagination import MessageCursorPagination
 
 User = get_user_model()
 
@@ -30,13 +35,13 @@ class ConversationViewSet(viewsets.GenericViewSet, mixins.ListModelMixin, mixins
     def retrieve(self, request, *args, **kwargs):
         conv = self.get_object()
         self.check_object_permissions(request, conv)
-        serializer = self.get_serializer(conv)
+        serializer = self.get_serializer(conv, context={"request": request})
         return Response(serializer.data)
 
     @transaction.atomic
     @action(detail=False, methods=["post"], url_path="create")
     def create_conversation(self, request):
-        serializer = ConversationCreateSerializer(data=request.data)
+        serializer = ConversationCreateSerializer(data=request.data, context={"request": request})
         serializer.is_valid(raise_exception=True)
         is_group = serializer.validated_data["is_group"]
         name = serializer.validated_data.get("name", "")
@@ -57,12 +62,19 @@ class ConversationViewSet(viewsets.GenericViewSet, mixins.ListModelMixin, mixins
                             status=status.HTTP_400_BAD_REQUEST)
 
         if not is_group:
+            # ⛔ Check bloqueo
+            other_id = next((u.id for u in users if u.id != current_user.id), None)
+            if other_id and is_blocked_either(current_user.id, other_id):
+                return Response(
+                    {"detail": "No puedes iniciar chat: uno de los usuarios ha bloqueado al otro."},
+                    status=status.HTTP_403_FORBIDDEN
+                )
+
             # 1:1: evitar duplicados
             uids = sorted([u.id for u in users])
             key = f"{uids[0]}:{uids[1]}"
             conv = Conversation.objects.filter(one_to_one_key=key).first()
             if conv:
-                # Ya existe, devolverla
                 data = ConversationSerializer(conv, context={"request": request}).data
                 return Response(data, status=status.HTTP_200_OK)
             conv = Conversation.objects.create(is_group=False, one_to_one_key=key)
@@ -83,20 +95,38 @@ class ConversationViewSet(viewsets.GenericViewSet, mixins.ListModelMixin, mixins
         if not conv.participants.filter(user=request.user).exists():
             return Response(status=status.HTTP_403_FORBIDDEN)
         # Actualiza last_read_at
+        now = timezone.now()
         ConversationParticipant.objects.filter(conversation=conv, user=request.user)\
-            .update(last_read_at=timezone.now())
-        return Response({"status": "ok"})
+            .update(last_read_at=now)
+
+        # 🔔 Emitir evento WS de read-receipt a la sala de la conversación
+        channel_layer = get_channel_layer()
+        async_to_sync(channel_layer.group_send)(
+            f"conv_{conv.id}",
+            {
+                "type": "chat.message",
+                "event": "conversation.read",
+                "by": request.user.id,
+                "at": now.isoformat(),
+            }
+        )
+        return Response({"status": "ok", "last_read_at": now.isoformat()})
 
 class MessageViewSet(viewsets.GenericViewSet, mixins.ListModelMixin, mixins.CreateModelMixin):
     permission_classes = [IsAuthenticated, IsConversationParticipant]
+    pagination_class = MessageCursorPagination
 
     def get_queryset(self):
         conv_id = self.kwargs.get("conversation_pk")
-        # Validación básica: el usuario debe ser participante
-        conv = Conversation.objects.filter(id=conv_id, participants__user=self.request.user).first()
-        if not conv:
+        if conv := Conversation.objects.filter(
+            id=conv_id, participants__user=self.request.user
+        ).first():
+            return (Message.objects
+                    .filter(conversation_id=conv_id, is_deleted=False)
+                    .select_related("sender", "conversation")
+                    .order_by("-created_at", "-id"))
+        else:
             return Message.objects.none()
-        return Message.objects.filter(conversation_id=conv_id, is_deleted=False).select_related("sender")
 
     def get_serializer_class(self):
         if self.action == "create":
@@ -105,8 +135,8 @@ class MessageViewSet(viewsets.GenericViewSet, mixins.ListModelMixin, mixins.Crea
 
     def list(self, request, *args, **kwargs):
         """
-        Paginación por query param ?cursor=<iso-datetime|id>, o usa paginación estándar DRF.
-        Para simpleza, usamos paginación estándar si la tienes configurada.
+        Paginación por cursor: usa ?cursor=<token> y ?page_size=30.
+        Orden: -created_at, -id.
         """
         return super().list(request, *args, **kwargs)
 
@@ -117,4 +147,16 @@ class MessageViewSet(viewsets.GenericViewSet, mixins.ListModelMixin, mixins.Crea
         if not conv.participants.filter(user=self.request.user).exists():
             from rest_framework.exceptions import PermissionDenied
             raise PermissionDenied("No perteneces a esta conversación.")
+
+        # ⛔ Check de bloqueo en 1:1 antes de crear el mensaje
+        if not conv.is_group:
+            other_id = (ConversationParticipant.objects
+                        .filter(conversation=conv)
+                        .exclude(user_id=self.request.user.id)
+                        .values_list("user_id", flat=True)
+                        .first())
+            if other_id and is_blocked_either(self.request.user.id, other_id):
+                from rest_framework.exceptions import PermissionDenied
+                raise PermissionDenied("No puedes enviar mensajes: uno de los usuarios ha bloqueado al otro.")
+
         serializer.save(conversation=conv, sender=self.request.user)

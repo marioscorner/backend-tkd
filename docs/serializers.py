@@ -1,17 +1,17 @@
+# docs/serializers.py
 from rest_framework import serializers
-from .models import BeltLevel, Technique, Document
+from .validators import validate_uploaded_file
+from .models import BeltLevel as Level, Technique, Document
+
+class LevelSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Level
+        fields = ["id", "name", "order", "is_public", "pdf"]
 
 class TechniqueSerializer(serializers.ModelSerializer):
     class Meta:
         model = Technique
         fields = ["id", "level", "name", "description", "image", "video_url"]
-
-class BeltLevelSerializer(serializers.ModelSerializer):
-    techniques = TechniqueSerializer(many=True, read_only=True)
-
-    class Meta:
-        model = BeltLevel
-        fields = ["id", "name", "order", "is_public", "pdf", "techniques"]
 
 class DocumentSerializer(serializers.ModelSerializer):
     class Meta:

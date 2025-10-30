@@ -1,39 +1,45 @@
-from rest_framework import serializers
 from django.contrib.auth import get_user_model
+from rest_framework import serializers
+from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 
 User = get_user_model()
 
+
 class UserSerializer(serializers.ModelSerializer):
+
     class Meta:
         model = User
-        fields = ['id', 'email', 'username', 'role']
+        fields = ["id", "username", "email", "role", "email_verified"]
+        read_only_fields = fields
+
 
 class RegisterSerializer(serializers.ModelSerializer):
-    role = serializers.ChoiceField(
-        choices=User.Roles.choices,
-        required=False,
-        default=User.Roles.ALUMNO
-    )
+
+    password = serializers.CharField(write_only=True, min_length=8)
 
     class Meta:
         model = User
-        fields = ['username', 'email', 'password', 'role']
-        extra_kwargs = {'password': {'write_only': True}}
+        fields = ["username", "email", "password", "role"]
 
     def create(self, validated_data):
-        password = validated_data.pop('password')
-        user = User.objects.create_user(**validated_data)
+        password = validated_data.pop("password")
+        user = User.objects.create(**validated_data)
         user.set_password(password)
         user.save()
         return user
 
-class LoginSerializer(serializers.Serializer):
-    email = serializers.EmailField()
-    password = serializers.CharField(write_only=True)
 
-    def validate(self, data):
-        from django.contrib.auth import authenticate
-        user = authenticate(email=data['email'], password=data['password'])
-        if not user:
-            raise serializers.ValidationError("Credenciales inválidas.")
-        return user
+class LoginSerializer(TokenObtainPairSerializer):
+
+    username_field = "email"
+
+    def validate(self, attrs):
+        data = super().validate(attrs)  # genera access/refresh y setea self.user
+        data["user"] = UserSerializer(self.user).data  # <- importante: no devolver objeto crudo
+        return data
+
+class ProfileUpdateSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = User
+        # permite editar lo que necesitas; aquí solo username
+        fields = ["username"]

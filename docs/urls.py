@@ -1,10 +1,21 @@
-from django.urls import path, include
-from rest_framework.routers import DefaultRouter
-from .views import BeltLevelViewSet, TechniqueViewSet, DocumentViewSet
+# backend-tkd-main/docs/urls.py
+from django.urls import path
+from .views import (
+    LevelListCreateView, LevelDetailView,
+    TechniqueListCreateView, TechniqueDetailView,
+    DocumentListCreateView, DocumentDetailView,
+)
 
-router = DefaultRouter()
-router.register(r'levels', BeltLevelViewSet, basename='levels')
-router.register(r'techniques', TechniqueViewSet, basename='techniques')
-router.register(r'documents', DocumentViewSet, basename='documents')
+urlpatterns = [
+    # Levels
+    path("levels/", LevelListCreateView.as_view()),
+    path("levels/<int:pk>/", LevelDetailView.as_view()),
 
-urlpatterns = [ path('', include(router.urls)) ]
+    # Techniques
+    path("techniques/", TechniqueListCreateView.as_view()),
+    path("techniques/<int:pk>/", TechniqueDetailView.as_view()),
+
+    # Documents
+    path("documents/", DocumentListCreateView.as_view()),
+    path("documents/<int:pk>/", DocumentDetailView.as_view()),
+]
